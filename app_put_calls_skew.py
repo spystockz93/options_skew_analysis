@@ -6,7 +6,7 @@ import yfinance as yf
 
 # Page Configuration
 st.set_page_config(
-    page_title="Options Skew & Max Pain Analyzer",
+    page_title="Options Skew & Max Pain Dashboard",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -23,26 +23,25 @@ ticker_symbol = (
     st.sidebar.text_input("Enter Ticker Symbol", value="GOOGL").upper().strip()
 )
 
+
 @st.cache_data(ttl=300)
 def load_stock_info(symbol: str):
     """Fetch available expirations and latest close price."""
     try:
         stock = yf.Ticker(symbol)
-        # Convert expirations tuple to a standard list of strings
         expirations = list(stock.options)
         hist = stock.history(period="1d")
         current_price = (
             float(hist["Close"].iloc[-1]) if not hist.empty else None
         )
         return expirations, current_price
-    except Exception as e:
+    except Exception:
         return [], None
 
 
-# Notice we only return expirations and current_price (no stock object)
 expirations, current_price = load_stock_info(ticker_symbol)
 
-if not expirations:
+if not expirations or not current_price:
     st.error(
         f"❌ Could not fetch options data for **{ticker_symbol}**. "
         "Please verify the symbol or try again during market hours."
@@ -63,56 +62,71 @@ def fetch_option_chain(symbol: str, exp: str):
 
 calls, puts = fetch_option_chain(ticker_symbol, selected_exp)
 
-# --- MAX PAIN CALCULATION ---
+# --- DATA CLEANING & FILTERING ---
+# Filter strikes to a realistic band (+/- 35% of stock price) to eliminate dead/illiquid strikes
+min_strike = current_price * 0.65
+max_strike = current_price * 1.35
+
+calls_clean = calls[
+    (calls["strike"] >= min_strike) & (calls["strike"] <= max_strike)
+].copy()
+puts_clean = puts[
+    (puts["strike"] >= min_strike) & (puts["strike"] <= max_strike)
+].copy()
+
+# Clean IV Data (Ignore bad pricing models with IV > 250% or IV < 1%)
+calls_clean = calls_clean[
+    (calls_clean["impliedVolatility"] > 0.01)
+    & (calls_clean["impliedVolatility"] < 2.5)
+]
+puts_clean = puts_clean[
+    (puts_clean["impliedVolatility"] > 0.01)
+    & (puts_clean["impliedVolatility"] < 2.5)
+]
+
+# --- MAX PAIN CALCULATION (RELEVANT STRIKES ONLY) ---
 strikes = sorted(
     list(
-        set(calls["strike"].dropna()).union(
-            set(puts["strike"].dropna())
+        set(calls_clean["strike"].dropna()).union(
+            set(puts_clean["strike"].dropna())
         )
     )
 )
-call_oi = calls.set_index("strike")["openInterest"].fillna(0).to_dict()
-put_oi = puts.set_index("strike")["openInterest"].fillna(0).to_dict()
+call_oi = calls_clean.set_index("strike")["openInterest"].fillna(0).to_dict()
+put_oi = puts_clean.set_index("strike")["openInterest"].fillna(0).to_dict()
 
 payouts = []
 for strike_price in strikes:
-    # Dollar value paid out to call holders if stock closes at strike_price
     call_payout = sum(
         max(0.0, strike_price - k) * oi
         for k, oi in call_oi.items()
         if strike_price > k
     )
-    # Dollar value paid out to put holders if stock closes at strike_price
     put_payout = sum(
         max(0.0, k - strike_price) * oi
         for k, oi in put_oi.items()
         if strike_price < k
     )
-    total_loss = (call_payout + put_payout) * 100.0  # 100 shares per contract
+    total_loss = (call_payout + put_payout) * 100.0
     payouts.append(total_loss)
 
 if payouts:
     max_pain_idx = int(np.argmin(payouts))
     max_pain_strike = strikes[max_pain_idx]
-    price_diff = (
-        (max_pain_strike - current_price) if current_price else 0.0
-    )
+    price_diff = max_pain_strike - current_price
 else:
-    max_pain_strike = 0.0
+    max_pain_strike = current_price
     price_diff = 0.0
 
 # Top Summary KPI Cards
 col1, col2, col3, col4 = st.columns(4)
 col1.metric(label="Ticker", value=ticker_symbol)
-col2.metric(
-    label="Current Underlying Price",
-    value=f"${current_price:.2f}" if current_price else "N/A",
-)
+col2.metric(label="Current Price", value=f"${current_price:.2f}")
 col3.metric(label="Selected Expiration", value=selected_exp)
 col4.metric(
     label="Max Pain Strike",
     value=f"${max_pain_strike:.2f}",
-    delta=f"{price_diff:+.2f} from price" if current_price else None,
+    delta=f"{price_diff:+.2f} from price",
 )
 
 st.markdown("---")
@@ -130,17 +144,14 @@ tab1, tab2, tab3 = st.tabs(
 with tab1:
     st.subheader(f"Implied Volatility (IV) Skew — {ticker_symbol} ({selected_exp})")
     st.caption(
-        "A higher Put IV at lower strikes shows traders paying a premium for downside protection (fear skew)."
+        "Cleaned IV curve (filtered for active, liquid strikes near current stock price)."
     )
-
-    valid_calls = calls[calls["impliedVolatility"] > 0.001]
-    valid_puts = puts[puts["impliedVolatility"] > 0.001]
 
     fig_skew = go.Figure()
     fig_skew.add_trace(
         go.Scatter(
-            x=valid_calls["strike"],
-            y=valid_calls["impliedVolatility"] * 100,
+            x=calls_clean["strike"],
+            y=calls_clean["impliedVolatility"] * 100,
             mode="lines+markers",
             name="Call IV",
             line=dict(color="#22c55e", width=2.5),
@@ -148,22 +159,21 @@ with tab1:
     )
     fig_skew.add_trace(
         go.Scatter(
-            x=valid_puts["strike"],
-            y=valid_puts["impliedVolatility"] * 100,
+            x=puts_clean["strike"],
+            y=puts_clean["impliedVolatility"] * 100,
             mode="lines+markers",
             name="Put IV",
             line=dict(color="#ef4444", width=2.5),
         )
     )
 
-    if current_price:
-        fig_skew.add_vline(
-            x=current_price,
-            line_dash="dash",
-            line_color="#3b82f6",
-            annotation_text=f"Stock Price: ${current_price:.2f}",
-            annotation_position="top right",
-        )
+    fig_skew.add_vline(
+        x=current_price,
+        line_dash="dash",
+        line_color="#3b82f6",
+        annotation_text=f"Stock Price: ${current_price:.2f}",
+        annotation_position="top right",
+    )
 
     fig_skew.update_layout(
         xaxis_title="Strike Price ($)",
@@ -178,16 +188,9 @@ with tab1:
 with tab2:
     st.subheader(f"Open Interest & Dealer Payout — {ticker_symbol}")
 
-    # Build Open Interest Table around underlying price (+/- 25%)
     df_oi = pd.DataFrame({"strike": strikes})
     df_oi["Call_OI"] = df_oi["strike"].map(call_oi).fillna(0)
     df_oi["Put_OI"] = df_oi["strike"].map(put_oi).fillna(0)
-
-    if current_price:
-        df_oi = df_oi[
-            (df_oi["strike"] >= current_price * 0.75)
-            & (df_oi["strike"] <= current_price * 1.25)
-        ]
 
     fig_oi = go.Figure()
     fig_oi.add_trace(
@@ -215,14 +218,13 @@ with tab2:
         annotation_position="top left",
     )
 
-    if current_price:
-        fig_oi.add_vline(
-            x=current_price,
-            line_dash="dash",
-            line_color="#3b82f6",
-            annotation_text=f"Current: ${current_price:.2f}",
-            annotation_position="bottom right",
-        )
+    fig_oi.add_vline(
+        x=current_price,
+        line_dash="dash",
+        line_color="#3b82f6",
+        annotation_text=f"Current: ${current_price:.2f}",
+        annotation_position="bottom right",
+    )
 
     fig_oi.update_layout(
         title="Open Interest by Strike (Calls Above / Puts Below Zero)",
@@ -265,9 +267,9 @@ with tab2:
 with tab3:
     col_call, col_put = st.columns(2)
     with col_call:
-        st.subheader("Calls Option Chain")
+        st.subheader("Calls Option Chain (Filtered)")
         st.dataframe(
-            calls[
+            calls_clean[
                 [
                     "strike",
                     "lastPrice",
@@ -280,9 +282,9 @@ with tab3:
             use_container_width=True,
         )
     with col_put:
-        st.subheader("Puts Option Chain")
+        st.subheader("Puts Option Chain (Filtered)")
         st.dataframe(
-            puts[
+            puts_clean[
                 [
                     "strike",
                     "lastPrice",
