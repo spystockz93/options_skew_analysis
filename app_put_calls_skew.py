@@ -1,10 +1,15 @@
+```python
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 
-# Page Configuration
+
+# ============================================================
+# PAGE CONFIG
+# ============================================================
+
 st.set_page_config(
     page_title="Options Skew & Max Pain Dashboard",
     page_icon="📈",
@@ -12,287 +17,263 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+
+# ============================================================
+# CONSTANTS
+# ============================================================
+
+OPTION_MULTIPLIER = 100
+
+DEFAULT_TICKER = "GOOGL"
+
+MIN_IV = 0.01       # 1%
+MAX_IV = 2.50       # 250%
+
+
+# ============================================================
+# PAGE TITLE
+# ============================================================
+
 st.title("📈 Options Volatility Skew & Max Pain Dashboard")
+
 st.markdown(
-    "Analyze dealer positioning, Implied Volatility (IV) skew across strike prices, and calculate **Max Pain**."
+    """
+    Analyze:
+
+    - Implied Volatility (IV) skew
+    - Call / Put Open Interest
+    - Max Pain
+    - Aggregate option payout at expiration
+    - Option-chain data
+
+    **Important:** Max Pain is calculated independently from IV filtering.
+    """
 )
 
-# Sidebar Ticker Input
-st.sidebar.header("Configuration")
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+
+st.sidebar.header("⚙️ Configuration")
+
 ticker_symbol = (
-    st.sidebar.text_input("Enter Ticker Symbol", value="GOOGL").upper().strip()
+    st.sidebar.text_input(
+        "Enter Ticker Symbol",
+        value=DEFAULT_TICKER,
+    )
+    .upper()
+    .strip()
 )
 
+if not ticker_symbol:
+    st.error("Please enter a ticker symbol.")
+    st.stop()
 
-@st.cache_data(ttl=300)
-def load_stock_info(symbol: str):
-    """Fetch available expirations and latest close price."""
+
+# ============================================================
+# DATA FUNCTIONS
+# ============================================================
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_stock_data(symbol: str):
+    """
+    Fetch available option expirations and current stock price.
+
+    Price priority:
+        1. fast_info.last_price
+        2. 1-day historical close
+    """
+
+    ticker = yf.Ticker(symbol)
+
+    # --------------------------------------------------------
+    # Expirations
+    # --------------------------------------------------------
+
     try:
-        stock = yf.Ticker(symbol)
-        expirations = list(stock.options)
-        hist = stock.history(period="1d")
-        current_price = (
-            float(hist["Close"].iloc[-1]) if not hist.empty else None
-        )
-        return expirations, current_price
+        expirations = list(ticker.options)
     except Exception:
-        return [], None
+        expirations = []
+
+    # --------------------------------------------------------
+    # Current price
+    # --------------------------------------------------------
+
+    current_price = None
+
+    try:
+        fast_info = ticker.fast_info
+
+        try:
+            current_price = fast_info.get("last_price")
+        except Exception:
+            current_price = None
+
+        if current_price is not None:
+            current_price = float(current_price)
+
+    except Exception:
+        current_price = None
+
+    # --------------------------------------------------------
+    # Historical fallback
+    # --------------------------------------------------------
+
+    if current_price is None or not np.isfinite(current_price):
+        try:
+            hist = ticker.history(
+                period="1d",
+                auto_adjust=False,
+            )
+
+            if not hist.empty:
+                current_price = float(hist["Close"].iloc[-1])
+
+        except Exception:
+            current_price = None
+
+    return expirations, current_price
 
 
-expirations, current_price = load_stock_info(ticker_symbol)
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_option_chain(symbol: str, expiration: str):
+    """
+    Fetch complete option chain.
 
-if not expirations or not current_price:
+    IMPORTANT:
+    No strike filtering or IV filtering happens here.
+    """
+
+    ticker = yf.Ticker(symbol)
+
+    option_chain = ticker.option_chain(expiration)
+
+    calls = option_chain.calls.copy()
+    puts = option_chain.puts.copy()
+
+    return calls, puts
+
+
+# ============================================================
+# LOAD STOCK DATA
+# ============================================================
+
+with st.spinner(f"Loading {ticker_symbol}..."):
+
+    expirations, current_price = load_stock_data(
+        ticker_symbol
+    )
+
+
+if not expirations:
     st.error(
-        f"❌ Could not fetch options data for **{ticker_symbol}**. "
-        "Please verify the symbol or try again during market hours."
+        f"""
+        ❌ No option expirations were found for **{ticker_symbol}**.
+
+        Possible causes:
+
+        - Invalid ticker
+        - No listed options
+        - Yahoo Finance temporarily unavailable
+        - Network/API issue
+        """
     )
     st.stop()
 
-# Expiration Selector
-selected_exp = st.sidebar.selectbox("Select Expiration Date", expirations)
 
-
-@st.cache_data(ttl=300)
-def fetch_option_chain(symbol: str, exp: str):
-    """Fetch calls and puts dataframes for the given expiration."""
-    stk = yf.Ticker(symbol)
-    opt = stk.option_chain(exp)
-    return opt.calls, opt.puts
-
-
-calls, puts = fetch_option_chain(ticker_symbol, selected_exp)
-
-# --- DATA CLEANING & FILTERING ---
-# Filter strikes to a realistic band (+/- 35% of stock price) to eliminate dead/illiquid strikes
-min_strike = current_price * 0.65
-max_strike = current_price * 1.35
-
-calls_clean = calls[
-    (calls["strike"] >= min_strike) & (calls["strike"] <= max_strike)
-].copy()
-puts_clean = puts[
-    (puts["strike"] >= min_strike) & (puts["strike"] <= max_strike)
-].copy()
-
-# Clean IV Data (Ignore bad pricing models with IV > 250% or IV < 1%)
-calls_clean = calls_clean[
-    (calls_clean["impliedVolatility"] > 0.01)
-    & (calls_clean["impliedVolatility"] < 2.5)
-]
-puts_clean = puts_clean[
-    (puts_clean["impliedVolatility"] > 0.01)
-    & (puts_clean["impliedVolatility"] < 2.5)
-]
-
-# --- MAX PAIN CALCULATION (RELEVANT STRIKES ONLY) ---
-strikes = sorted(
-    list(
-        set(calls_clean["strike"].dropna()).union(
-            set(puts_clean["strike"].dropna())
-        )
+if current_price is None or current_price <= 0:
+    st.error(
+        f"❌ Could not determine a valid price for {ticker_symbol}."
     )
-)
-call_oi = calls_clean.set_index("strike")["openInterest"].fillna(0).to_dict()
-put_oi = puts_clean.set_index("strike")["openInterest"].fillna(0).to_dict()
+    st.stop()
 
-payouts = []
-for strike_price in strikes:
-    call_payout = sum(
-        max(0.0, strike_price - k) * oi
-        for k, oi in call_oi.items()
-        if strike_price > k
-    )
-    put_payout = sum(
-        max(0.0, k - strike_price) * oi
-        for k, oi in put_oi.items()
-        if strike_price < k
-    )
-    total_loss = (call_payout + put_payout) * 100.0
-    payouts.append(total_loss)
 
-if payouts:
-    max_pain_idx = int(np.argmin(payouts))
-    max_pain_strike = strikes[max_pain_idx]
-    price_diff = max_pain_strike - current_price
-else:
-    max_pain_strike = current_price
-    price_diff = 0.0
+# ============================================================
+# SIDEBAR SETTINGS
+# ============================================================
 
-# Top Summary KPI Cards
-col1, col2, col3, col4 = st.columns(4)
-col1.metric(label="Ticker", value=ticker_symbol)
-col2.metric(label="Current Price", value=f"${current_price:.2f}")
-col3.metric(label="Selected Expiration", value=selected_exp)
-col4.metric(
-    label="Max Pain Strike",
-    value=f"${max_pain_strike:.2f}",
-    delta=f"{price_diff:+.2f} from price",
+selected_exp = st.sidebar.selectbox(
+    "Expiration Date",
+    expirations,
 )
 
-st.markdown("---")
 
-# Main Interface Tabs
-tab1, tab2, tab3 = st.tabs(
+st.sidebar.markdown("---")
+
+st.sidebar.subheader("IV Skew Settings")
+
+moneyness_range = st.sidebar.slider(
+    "Skew Range (% of Spot)",
+    min_value=50,
+    max_value=100,
+    value=(65, 135),
+    step=5,
+)
+
+skew_x_axis = st.sidebar.radio(
+    "Skew X-Axis",
     [
-        "📊 Volatility Skew",
-        "🎯 Max Pain & Open Interest",
-        "📑 Option Chain Tables",
-    ]
+        "Moneyness (%)",
+        "Strike Price ($)",
+    ],
 )
 
-# TAB 1: IV SKEW
-with tab1:
-    st.subheader(f"Implied Volatility (IV) Skew — {ticker_symbol} ({selected_exp})")
-    st.caption(
-        "Cleaned IV curve (filtered for active, liquid strikes near current stock price)."
-    )
 
-    fig_skew = go.Figure()
-    fig_skew.add_trace(
-        go.Scatter(
-            x=calls_clean["strike"],
-            y=calls_clean["impliedVolatility"] * 100,
-            mode="lines+markers",
-            name="Call IV",
-            line=dict(color="#22c55e", width=2.5),
+# ============================================================
+# LOAD OPTION CHAIN
+# ============================================================
+
+try:
+
+    with st.spinner(
+        f"Loading option chain for {selected_exp}..."
+    ):
+
+        calls_raw, puts_raw = fetch_option_chain(
+            ticker_symbol,
+            selected_exp,
         )
-    )
-    fig_skew.add_trace(
-        go.Scatter(
-            x=puts_clean["strike"],
-            y=puts_clean["impliedVolatility"] * 100,
-            mode="lines+markers",
-            name="Put IV",
-            line=dict(color="#ef4444", width=2.5),
-        )
-    )
 
-    fig_skew.add_vline(
-        x=current_price,
-        line_dash="dash",
-        line_color="#3b82f6",
-        annotation_text=f"Stock Price: ${current_price:.2f}",
-        annotation_position="top right",
-    )
+except Exception as e:
 
-    fig_skew.update_layout(
-        xaxis_title="Strike Price ($)",
-        yaxis_title="Implied Volatility (%)",
-        template="plotly_dark",
-        height=520,
-        hovermode="x unified",
+    st.error(
+        f"❌ Unable to load option chain: {e}"
     )
-    st.plotly_chart(fig_skew, use_container_width=True)
+    st.stop()
 
-# TAB 2: MAX PAIN & OPEN INTEREST
-with tab2:
-    st.subheader(f"Open Interest & Dealer Payout — {ticker_symbol}")
 
-    df_oi = pd.DataFrame({"strike": strikes})
-    df_oi["Call_OI"] = df_oi["strike"].map(call_oi).fillna(0)
-    df_oi["Put_OI"] = df_oi["strike"].map(put_oi).fillna(0)
+# ============================================================
+# VALIDATE OPTION CHAIN
+# ============================================================
 
-    fig_oi = go.Figure()
-    fig_oi.add_trace(
-        go.Bar(
-            x=df_oi["strike"],
-            y=df_oi["Call_OI"],
-            name="Call Open Interest",
-            marker_color="#22c55e",
-        )
+if calls_raw.empty and puts_raw.empty:
+
+    st.error(
+        "❌ The selected expiration contains no option contracts."
     )
-    fig_oi.add_trace(
-        go.Bar(
-            x=df_oi["strike"],
-            y=-df_oi["Put_OI"],
-            name="Put Open Interest",
-            marker_color="#ef4444",
-        )
-    )
+    st.stop()
 
-    fig_oi.add_vline(
-        x=max_pain_strike,
-        line_dash="solid",
-        line_color="#f59e0b",
-        annotation_text=f"Max Pain: ${max_pain_strike:.2f}",
-        annotation_position="top left",
-    )
 
-    fig_oi.add_vline(
-        x=current_price,
-        line_dash="dash",
-        line_color="#3b82f6",
-        annotation_text=f"Current: ${current_price:.2f}",
-        annotation_position="bottom right",
-    )
+# ============================================================
+# STANDARDIZE NUMERIC COLUMNS
+# ============================================================
 
-    fig_oi.update_layout(
-        title="Open Interest by Strike (Calls Above / Puts Below Zero)",
-        xaxis_title="Strike Price ($)",
-        yaxis_title="Open Interest (Contracts)",
-        barmode="relative",
-        template="plotly_dark",
-        height=450,
-    )
-    st.plotly_chart(fig_oi, use_container_width=True)
+def clean_option_data(df: pd.DataFrame) -> pd.DataFrame:
 
-    # Dealer Payout Curve
-    fig_payout = go.Figure()
-    fig_payout.add_trace(
-        go.Scatter(
-            x=strikes,
-            y=[p / 1e6 for p in payouts],
-            mode="lines",
-            name="Dealer Payout ($M)",
-            line=dict(color="#a855f7", width=3),
-        )
-    )
-    fig_payout.add_vline(
-        x=max_pain_strike,
-        line_dash="solid",
-        line_color="#f59e0b",
-        annotation_text=f"Min Dealer Payout: ${max_pain_strike:.2f}",
-    )
+    df = df.copy()
 
-    fig_payout.update_layout(
-        title="Dealer Dollar Payout at Expiry (Lowest Point = Max Pain)",
-        xaxis_title="Stock Price at Expiration ($)",
-        yaxis_title="Total Payout to Buyers ($ Millions)",
-        template="plotly_dark",
-        height=400,
-    )
-    st.plotly_chart(fig_payout, use_container_width=True)
+    numeric_columns = [
+        "strike",
+        "lastPrice",
+        "bid",
+        "ask",
+        "volume",
+        "openInterest",
+        "impliedVolatility",
+    ]
 
-# TAB 3: RAW DATA TABLES
-with tab3:
-    col_call, col_put = st.columns(2)
-    with col_call:
-        st.subheader("Calls Option Chain (Filtered)")
-        st.dataframe(
-            calls_clean[
-                [
-                    "strike",
-                    "lastPrice",
-                    "bid",
-                    "ask",
-                    "openInterest",
-                    "impliedVolatility",
-                ]
-            ],
-            use_container_width=True,
-        )
-    with col_put:
-        st.subheader("Puts Option Chain (Filtered)")
-        st.dataframe(
-            puts_clean[
-                [
-                    "strike",
-                    "lastPrice",
-                    "bid",
-                    "ask",
-                    "openInterest",
-                    "impliedVolatility",
-                ]
-            ],
-            use_container_width=True,
-        )
+    for column in numeric_columns:
+
+        if column in df.columns:
+```
