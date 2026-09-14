@@ -23,26 +23,26 @@ ticker_symbol = (
     st.sidebar.text_input("Enter Ticker Symbol", value="GOOGL").upper().strip()
 )
 
-
 @st.cache_data(ttl=300)
 def load_stock_info(symbol: str):
-    """Fetch stock ticker object, available expirations, and latest close price."""
+    """Fetch available expirations and latest close price."""
     try:
         stock = yf.Ticker(symbol)
-        expirations = stock.options
+        # Convert expirations tuple to a standard list of strings
+        expirations = list(stock.options)
         hist = stock.history(period="1d")
         current_price = (
             float(hist["Close"].iloc[-1]) if not hist.empty else None
         )
-        return stock, expirations, current_price
+        return expirations, current_price
     except Exception as e:
-        st.sidebar.error(f"Error fetching data: {e}")
-        return None, None, None
+        return [], None
 
 
-stock, expirations, current_price = load_stock_info(ticker_symbol)
+# Notice we only return expirations and current_price (no stock object)
+expirations, current_price = load_stock_info(ticker_symbol)
 
-if not stock or not expirations:
+if not expirations:
     st.error(
         f"❌ Could not fetch options data for **{ticker_symbol}**. "
         "Please verify the symbol or try again during market hours."
